@@ -1,25 +1,14 @@
 use crate::util::get_filename;
 use anyhow::{anyhow, bail, Error, Result};
-use chrono::{Date, DateTime, Local};
-use futures_util::{
-    future::{join, join_all},
-    join, FutureExt, StreamExt, TryFutureExt,
-};
-use getset::{CopyGetters, Getters, MutGetters, Setters};
+use chrono::{DateTime, Local};
+use futures_util::{future::join_all, join, TryFutureExt};
+use getset::Getters;
 use log::{debug, error, info, trace};
 use scraper::{Html, Selector};
 use semver::Version;
-use std::{fmt::Display, ops::Deref, path::Path, str::FromStr};
-use tempfile::tempfile;
-use tokio::fs as afs;
-use url::Url;
+use std::fmt::Display;
 
-pub struct PublishedInfo {
-    release_date: Date<Local>,
-    version: String,
-    required_java_version: String,
-    notes: String,
-}
+use url::Url;
 
 #[derive(Debug, PartialEq, Eq, Clone, Getters)]
 #[getset(get = "pub")]

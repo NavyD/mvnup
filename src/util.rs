@@ -1,8 +1,8 @@
-use std::{fmt::Display, path::Path, str::FromStr};
+use std::path::Path;
 
-use anyhow::{anyhow, bail, Error, Result};
+use anyhow::{anyhow, Result};
 use cmd_lib::run_fun;
-use log::{debug, trace};
+use log::trace;
 use regex::Regex;
 use semver::Version;
 use url::Url;

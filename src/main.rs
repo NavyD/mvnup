@@ -1,33 +1,17 @@
-use std::{
-    collections::HashMap,
-    fmt::Display,
-    io::Write,
-    path::{Path, PathBuf},
-    process::exit,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{path::PathBuf, process::exit, sync::Arc};
 
-use cmd_lib::{run_cmd, run_fun};
+use anyhow::{anyhow, bail, Result};
 use comfy_table::Table;
+use futures_util::{future::join_all, try_join};
+use log::{debug, trace, warn};
 use mvnup::{
     site::{BinFile, Site},
     util::find_mvn_version,
 };
-use once_cell::sync::Lazy;
-use regex::Regex;
 use semver::Version;
-use tokio::{fs as afs, sync::Mutex};
-
-use anyhow::{anyhow, bail, Error, Result};
-use chrono::{Date, DateTime, Local};
-use futures_util::{future::join_all, try_join, StreamExt};
-use log::{debug, error, info, trace, warn};
-use scraper::{Html, Selector};
 use structopt::StructOpt;
-use tempfile::tempfile;
-use tokio::io::AsyncWriteExt;
-use url::{ParseError, Url};
+use tokio::sync::Mutex;
+use url::Url;
 use which::which;
 
 #[tokio::main]
@@ -65,10 +49,6 @@ impl Opt {
             .filter_module(module_path!(), level)
             .init();
         Ok(())
-    }
-
-    async fn run(&self) -> Result<()> {
-        todo!()
     }
 }
 
@@ -139,7 +119,7 @@ impl Program {
         }
     }
 
-    fn install(&self, args: &InstallArgs) -> Result<()> {
+    fn install(&self, _args: &InstallArgs) -> Result<()> {
         todo!()
     }
 
