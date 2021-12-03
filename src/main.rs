@@ -1,24 +1,34 @@
-use std::{path::PathBuf, process::exit, sync::Arc};
-
-use anyhow::{anyhow, bail, Result};
-use comfy_table::Table;
-use futures_util::{future::join_all, try_join};
-use log::{debug, trace, warn};
-use mvnup::{
-    site::{BinFile, Site},
-    util::find_mvn_version,
+use std::{
+    collections::HashSet,
+    fs::File,
+    path::{Path, PathBuf},
+    process::exit,
+    sync::Arc,
 };
-use semver::Version;
+
+use anyhow::{anyhow, bail, Error, Result};
+use comfy_table::Table;
+use directories::{BaseDirs, ProjectDirs, UserDirs};
+use futures_util::StreamExt;
+use futures_util::{future::join_all, try_join};
+use glob::glob;
+use log::{debug, info, trace, warn};
+use mvnup::{
+    site::{BinFile, Site, HTTP_CLIENT},
+    util::{extract, find_java_version, find_mvn_version, match_digests},
+    CRATE_NAME,
+};
+use semver::{Version, VersionReq};
 use structopt::StructOpt;
 use tokio::sync::Mutex;
+use tokio::{fs as afs, io::AsyncWriteExt};
 use url::Url;
 use which::which;
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt = Opt::from_args();
     opt.init_log()?;
-    Program::new(opt).run().await;
+    Program::new(opt)?.run().await;
     Ok(())
 }
 
@@ -29,9 +39,6 @@ pub struct Opt {
 
     #[structopt(long, short, parse(from_occurrences))]
     verbose: u8,
-
-    #[structopt(long, short)]
-    list: bool,
 
     #[structopt(subcommand)]
     commands: Option<Commands>,
@@ -66,6 +73,7 @@ enum Commands {
         #[structopt(flatten)]
         args: ListArgs,
     },
+    Clean,
 }
 
 #[derive(Debug, StructOpt)]
@@ -73,8 +81,8 @@ struct InstallArgs {
     #[structopt(long, short, default_value = "")]
     path: PathBuf,
 
-    #[structopt(long, short, default_value = "")]
-    version: String,
+    #[structopt(long, short)]
+    version: Option<String>,
 }
 
 #[derive(Debug, StructOpt)]
@@ -87,15 +95,20 @@ struct Program {
     site: Site,
     versions: Arc<Mutex<Vec<Version>>>,
     opt: Opt,
+    cache_dir: PathBuf,
+    base_dir: BaseDirs,
 }
 
 impl Program {
-    pub fn new(opt: Opt) -> Self {
-        Self {
+    pub fn new(opt: Opt) -> Result<Self> {
+        let basedir = BaseDirs::new().ok_or_else(|| anyhow!("not found base dir"))?;
+        Ok(Self {
             versions: Arc::new(Mutex::new(vec![])),
             site: Site::new(opt.mirror.clone()).expect("new site error"),
             opt,
-        }
+            cache_dir: basedir.cache_dir().join(CRATE_NAME),
+            base_dir: basedir,
+        })
     }
 
     pub async fn run(&self) {
@@ -119,8 +132,89 @@ impl Program {
         }
     }
 
-    fn install(&self, _args: &InstallArgs) -> Result<()> {
-        todo!()
+    async fn install(&self, args: &InstallArgs) -> Result<()> {
+        let to_path = args.path.as_path();
+        // check path
+        if !to_path.exists() {
+            info!("creating dir of install: {}", to_path.display());
+            afs::create_dir_all(to_path).await?;
+        } else if !to_path.is_dir() {
+            bail!("{} is not a dir", to_path.display());
+        } else if to_path.read_dir().map(|mut dir| dir.next().is_some())? {
+            bail!("{} is not a empty dir", to_path.display());
+        }
+
+        // match mvn version
+        let mvn_version = if let Some(ver_pat) = &args.version {
+            self.match_version(ver_pat).await?
+        } else {
+            self.latest_version().await?
+        };
+
+        println!(
+            "selected mvn version {} of installation to {}",
+            mvn_version,
+            to_path.display()
+        );
+
+        // select one
+        let bins = self.site.fetch_bins(mvn_version).await?;
+        let select_bin = self.choose_bin(&bins)?;
+
+        // download
+        let down_path = self.cache_dir.join(select_bin.filename());
+        if down_path.is_file() {
+            if match_digests(down_path.as_path(), select_bin) {
+                println!("using cached file: {}", down_path.display());
+            } else {
+                bail!(
+                    "failed to install: has exists same file {}",
+                    down_path.display()
+                );
+            }
+        } else {
+            println!("downloading {}", select_bin.filename());
+            select_bin.download(down_path.as_path()).await?;
+        }
+
+        // extract to path
+        extract(down_path.as_path(), to_path)?;
+
+        // link to $PATH
+        let exe_path = glob(&format!("{}/**/mvn", to_path.display()))
+            .map_err::<Error, _>(Into::into)?
+            .flatten()
+            .next()
+            .ok_or_else(|| anyhow!("not found mvn bin in {}", to_path.display()))?;
+        #[cfg(unix)]
+        {
+            if let Some(bin_path) = self.base_dir.executable_dir().map(|p| p.join("mvn")) {
+                if !bin_path.exists() {
+                    println!("creating link to {}", bin_path.display());
+                    std::os::unix::fs::symlink(to_path, bin_path)?;
+                    println!("installation successful. just type: mvn");
+                    return Ok(());
+                }
+            }
+        }
+        println!(
+            "installation successful. please add {} to your PATH",
+            exe_path.display()
+        );
+        Ok(())
+    }
+
+    fn choose_bin<'a>(&self, bins: &'a [BinFile]) -> Result<&'a BinFile> {
+        let tar_suffix = [".tar.gz", ".tar.bz2", ".tar.xz"]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let has_tar = which("tar").is_ok();
+        for bin in bins {
+            if has_tar && tar_suffix.iter().any(|s| bin.filename().ends_with(s)) {
+                return Ok(bin);
+            }
+        }
+        bail!("not found a bin")
     }
 
     async fn list(&self, args: &ListArgs) -> Result<()> {
@@ -163,13 +257,12 @@ impl Program {
         // check if mvn is installed
         match which("mvn") {
             Ok(p) => {
-                let path_str = p.to_str().expect("to str error");
-                debug!("found mvn path: {}", path_str);
-
+                debug!("found mvn path: {}", p.display());
                 let cur_ver = find_mvn_version(p.clone())?;
                 println!(
                     "found installed maven version: {}, path: {}",
-                    cur_ver, path_str
+                    cur_ver,
+                    p.display()
                 );
                 let latest_ver = self.latest_version().await?;
                 let (cur_date, latest_date) = try_join!(
@@ -209,6 +302,24 @@ impl Program {
             }
         }
         Ok(())
+    }
+
+    async fn match_version(&self, ver_pat: &str) -> Result<Version> {
+        // check java version
+        trace!("finding java version");
+        let _java_ver = which("java")
+            .map_err(Into::into)
+            .and_then(find_java_version)
+            .map_err(|e| anyhow!("failed to find java version: {}", e))?;
+        // todo: match with java version
+
+        let req = ver_pat.parse::<VersionReq>()?;
+        self.versions()
+            .await?
+            .iter()
+            .find(|ver| req.matches(ver))
+            .cloned()
+            .ok_or_else(|| anyhow!("not matched version for {}", ver_pat))
     }
 
     async fn versions(&self) -> Result<Vec<Version>> {
@@ -254,14 +365,19 @@ impl Program {
     }
 }
 
-// pub async fn download(&self, ver: &str) -> Result<afs::File> {
-//     let url = self.zip_bin_url(ver);
-//     let resp = reqwest::get(url).await?;
-//     let mut stream = resp.bytes_stream();
-//     let mut tmpfile = afs::File::from_std(tempfile()?);
-//     while let Some(chunk) = stream.next().await {
-//         let mut chunk = chunk?;
-//         tmpfile.write_all_buf(&mut chunk).await?;
-//     }
-//     Ok(tmpfile)
-// }
+struct Downloader {
+    cache_dir: PathBuf,
+}
+
+impl Downloader {
+    pub fn new() -> Result<Self> {
+        let basedir = BaseDirs::new().ok_or_else(|| anyhow!("not found base dir"))?;
+        Ok(Self {
+            cache_dir: basedir.cache_dir().join(CRATE_NAME),
+        })
+    }
+
+    pub fn download(&self, url: &str) -> Result<()> {
+        todo!()
+    }
+}
