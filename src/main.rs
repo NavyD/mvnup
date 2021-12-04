@@ -1,12 +1,14 @@
 use std::{
     collections::HashSet,
     fs::File,
+    os::unix::prelude::PermissionsExt,
     path::{Path, PathBuf},
     process::exit,
     sync::Arc,
 };
 
 use anyhow::{anyhow, bail, Error, Result};
+use cmd_lib::run_fun;
 use comfy_table::Table;
 use directories::{BaseDirs, ProjectDirs, UserDirs};
 use futures_util::StreamExt;
@@ -78,7 +80,7 @@ enum Commands {
 
 #[derive(Debug, StructOpt)]
 struct InstallArgs {
-    #[structopt(long, short, default_value = "")]
+    #[structopt(long, short)]
     path: PathBuf,
 
     #[structopt(long, short)]
@@ -102,11 +104,13 @@ struct Program {
 impl Program {
     pub fn new(opt: Opt) -> Result<Self> {
         let basedir = BaseDirs::new().ok_or_else(|| anyhow!("not found base dir"))?;
+        let cache_dir = basedir.cache_dir().join(CRATE_NAME);
+        std::fs::create_dir_all(&cache_dir)?;
         Ok(Self {
             versions: Arc::new(Mutex::new(vec![])),
             site: Site::new(opt.mirror.clone()).expect("new site error"),
             opt,
-            cache_dir: basedir.cache_dir().join(CRATE_NAME),
+            cache_dir,
             base_dir: basedir,
         })
     }
@@ -116,6 +120,12 @@ impl Program {
             Some(Commands::List { args }) => {
                 if let Err(e) = self.list(args).await {
                     eprintln!("list failed: {}", e);
+                    exit(1);
+                }
+            }
+            Some(Commands::Install { args }) => {
+                if let Err(e) = self.install(args).await {
+                    eprintln!("install failed: {}", e);
                     exit(1);
                 }
             }
@@ -133,6 +143,14 @@ impl Program {
     }
 
     async fn install(&self, args: &InstallArgs) -> Result<()> {
+        if let Ok(p) = which("mvn") {
+            bail!(
+                "already installed {} version of mvn: {}",
+                find_mvn_version(p.as_path())?,
+                p.display()
+            );
+        }
+
         let to_path = args.path.as_path();
         // check path
         if !to_path.exists() {
@@ -163,15 +181,9 @@ impl Program {
 
         // download
         let down_path = self.cache_dir.join(select_bin.filename());
-        if down_path.is_file() {
-            if match_digests(down_path.as_path(), select_bin) {
-                println!("using cached file: {}", down_path.display());
-            } else {
-                bail!(
-                    "failed to install: has exists same file {}",
-                    down_path.display()
-                );
-            }
+        if down_path.is_file() && match_digests(down_path.as_path(), select_bin) {
+            // cache
+            println!("using cached file: {}", down_path.display());
         } else {
             println!("downloading {}", select_bin.filename());
             select_bin.download(down_path.as_path()).await?;
@@ -185,13 +197,18 @@ impl Program {
             .map_err::<Error, _>(Into::into)?
             .flatten()
             .next()
-            .ok_or_else(|| anyhow!("not found mvn bin in {}", to_path.display()))?;
-        #[cfg(unix)]
+            .ok_or_else(|| anyhow!("not found mvn bin in {}", to_path.display()))?
+            .canonicalize()?;
+        #[cfg(target_os = "linux")]
         {
             if let Some(bin_path) = self.base_dir.executable_dir().map(|p| p.join("mvn")) {
                 if !bin_path.exists() {
-                    println!("creating link to {}", bin_path.display());
-                    std::os::unix::fs::symlink(to_path, bin_path)?;
+                    println!(
+                        "creating link {} for {}",
+                        bin_path.display(),
+                        exe_path.display(),
+                    );
+                    std::os::unix::fs::symlink(exe_path, bin_path)?;
                     println!("installation successful. just type: mvn");
                     return Ok(());
                 }

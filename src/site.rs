@@ -1,7 +1,7 @@
 use crate::util::get_filename;
 use anyhow::{anyhow, bail, Error, Result};
 use chrono::{DateTime, Local};
-use futures_util::{future::join_all, join, StreamExt, TryFutureExt};
+use futures_util::{future::join_all, join, try_join, StreamExt, TryFutureExt};
 use getset::Getters;
 use log::{debug, error, info, log_enabled, trace, warn};
 use mime::Mime;
@@ -9,7 +9,14 @@ use once_cell::sync::Lazy;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use semver::Version;
-use std::{collections::HashSet, fmt::Display, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    io::{BufReader, Cursor, Read},
+    path::Path,
+    time::Duration,
+};
+use strum::{AsRefStr, Display, EnumString, EnumVariantNames, VariantNames};
 use tokio::{fs as afs, io::AsyncWriteExt};
 use url::Url;
 
@@ -20,30 +27,66 @@ pub static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .expect("build client failed")
 });
 
+// macro_rules! field_names {
+//     (struct $name:ident {
+//         $($field_name:ident: $field_type:ty,)*
+//     }) => {
+//         #[derive(Debug, PartialEq, Eq, Clone, Getters, Default)]
+//         pub struct $name {
+//             $($field_name: $field_type,)*
+//         }
+
+//         impl $name {
+//             // This is purely an example—not a good one.
+//             fn get_field_names() -> Vec<&'static str> {
+//                 vec![$(stringify!($field_name)),*]
+//             }
+
+//             fn from_entries(v: impl std::iter::IntoIterator<Item = (String, Option<Option<String>>)>) -> Self {
+//                 let v = v.into_iter().collect::<::std::collections::HashMap<_, _>>();
+//                 Self {$(
+//                     $field_name: v["$field_name"].clone(),
+//                 )*}
+//             }
+//         }
+//     }
+// }
 macro_rules! field_names {
-    (struct $name:ident {
-        $($field_name:ident: $field_type:ty,)*
+    (
+        $(#[$m:meta])?
+        $aa:vis enum $name:ident {
+        $($field_name:ident($field_type:ty))*
+
     }) => {
-        #[derive(Debug, PartialEq, Eq, Clone, Getters, Default)]
-        struct $name {
-            $($field_name: $field_type,)*
+        // #[derive(Debug, PartialEq, Eq, Clone, Getters, Default)]
+        // pub struct $name {
+        //     $($field_name: $field_type,)*
+        // }
+        $aa enum $name {
+            $($field_name($field_type))*
         }
 
         impl $name {
-            // This is purely an example—not a good one.
-            fn get_field_names() -> Vec<&'static str> {
-                vec![$(stringify!($field_name)),*]
+            pub fn new(variant_name: &str, cxt: &str) -> Self {
+                todo!()
             }
         }
     }
 }
 
-field_names! {
-    struct Digest {
-        sha512: Option<Option<String>>,
-        md5: Option<Option<String>>,
-        sha1: Option<Option<String>>,
-    }
+// field_names! {
+//     struct Digest {
+//         sha512: Option<Option<String>>,
+//         md5: Option<Option<String>>,
+//         sha1: Option<Option<String>>,
+//     }
+// }
+
+#[derive(Debug, Clone, PartialEq, Eq, EnumVariantNames, EnumString, AsRefStr)]
+pub enum Digest {
+    Sha512(String),
+    Md5(String),
+    Sha1(String),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Getters)]
@@ -53,10 +96,8 @@ pub struct BinFile {
     filename: String,
     last_modified: DateTime<Local>,
     size: usize,
-    sha512: Option<Option<String>>,
-    md5: Option<Option<String>>,
-    sha1: Option<Option<String>>,
     mime: Mime,
+    digest: Option<Digest>,
 }
 
 impl BinFile {
@@ -64,7 +105,7 @@ impl BinFile {
         let path = path.as_ref();
         trace!("starting download to {} for {}", path.display(), self.url());
         let mut file = afs::File::create(path).await?;
-        let resp = HTTP_CLIENT.get(self.url.clone()).send().await?;
+        let resp = reqwest::get(self.url.clone()).await?;
         debug!(
             "downloading file content length: {:?}, size: {}",
             resp.content_length(),
@@ -82,7 +123,8 @@ impl BinFile {
                 file.metadata().await?.len()
             );
         }
-        if self.has_digests() {
+        // self.digest.map(|digest| digest.check(s))
+        if let Some(d) = self.digest() {
             // todo!()
             return Ok(());
         } else {
@@ -90,73 +132,6 @@ impl BinFile {
         }
         Ok(())
     }
-
-    pub fn has_digests(&self) -> bool {
-        self.sha1
-            .as_ref()
-            .or_else(|| self.md5.as_ref())
-            .or_else(|| self.sha512.as_ref())
-            .is_some()
-    }
-
-    // /// 从bin url中解析出文件信息：`https://archive.apache.org/dist/maven/maven-3/3.8.4/binaries/apache-maven-3.8.4-bin.tar.gz`
-    // pub async fn new<U>(bin_url: U) -> Result<Self>
-    // where
-    //     U: TryInto<Url> + Display,
-    //     U::Error: Into<Error>,
-    // {
-    //     let url: Url = bin_url.try_into().map_err(Into::into)?;
-    //     let filename = get_filename(&url)?;
-
-    //     let fetch_cxt = |url: Url| {
-    //         let dup_url = url.to_string();
-    //         async move {
-    //             trace!("fetching digest content for {}", url);
-    //             let filename = get_filename(&url)?;
-    //             let resp = reqwest::get(url.as_str()).await?;
-    //             if !resp.status().is_success() {
-    //                 trace!(
-    //                     "failed to fetch digest for {}. status: {}, headers: {:?}",
-    //                     url,
-    //                     resp.status(),
-    //                     resp.headers()
-    //                 );
-    //                 bail!(
-    //                     "failed to get digest {}. status: {}",
-    //                     filename,
-    //                     resp.status()
-    //                 );
-    //             }
-    //             debug!("found digest for {}", filename);
-    //             resp.text().await.map_err(Into::into)
-    //         }
-    //         .map_err(move |e| {
-    //             info!("failed to fetch digest for {}: {}", dup_url, e);
-    //             e
-    //         })
-    //     };
-
-    //     // concurrent build
-    //     match join!(
-    //         fetch_bin_metadata(url.clone()),
-    //         fetch_cxt(url.join(&format!("{}.md5", filename))?),
-    //         fetch_cxt(url.join(&format!("{}.sha1", filename))?),
-    //         fetch_cxt(url.join(&format!("{}.sha512", filename))?)
-    //     ) {
-    //         (Ok((filename, last_modified, size)), md5, sha1, sha512) => Ok(Self {
-    //             url,
-    //             filename,
-    //             last_modified,
-    //             size,
-    //             md5: md5.ok(),
-    //             sha1: sha1.ok(),
-    //             sha512: sha512.ok(),
-    //         }),
-    //         (Err(e), ..) => {
-    //             bail!("failed to fetch bin metadata for {}: {}", url, e);
-    //         }
-    //     }
-    // }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Getters)]
@@ -188,123 +163,76 @@ impl Site {
         let url = self
             .mirror
             .join(&format!("maven/maven-3/{}/binaries/", ver))?;
-        debug!("fetching binaries for {}", url);
+
+        // concurrent
+        debug!("fetching {} binaries for {}", ver, url);
         let content = HTTP_CLIENT.get(url.clone()).send().await?.text().await?;
-        let names = parse_bin_names(&content)?;
-        if names.is_empty() {
-            error!(
-                "failed to parse bin names for {} in content: {}",
-                url, content
-            );
-            bail!("not found bin names");
-        }
-        trace!("finding digests in files: {:?}", names);
-        // let bins = join_all(
-        //     names
-        //         .into_iter()
-        //         .flat_map(|name| url.join(&name))
-        //         .map(BinFile::new),
-        // )
-        // .await;
-
-        // trace!("found bin files result: {:?}", bins);
-        // Ok(bins.into_iter().flatten().collect())
-        todo!()
-    }
-
-    /// 对url使用head请求获取binaries文件元数据
-    /// 如：https://archive.apache.org/dist/maven/maven-3/3.8.4/binaries/apache-maven-3.8.4-bin.tar.gz
-    async fn fetch_bin_metadata<U>(&self, ver: Version) -> Result<BinFile> {
-        let url = self
-            .mirror
-            .join(&format!("maven/maven-3/{}/binaries/", ver))?;
-        debug!("fetching binaries for {}", url);
-        let content = HTTP_CLIENT.get(url.clone()).send().await?.text().await?;
-        let names = parse_bin_names(&content)?;
-        if names.is_empty() {
-            error!(
-                "failed to parse bin names for {} in content: {}",
-                url, content
-            );
-            bail!("not found bin names");
-        }
-
-        let filename = get_filename(&url)?;
-
-        debug!("fetching bin metadata {} for {}", filename, url);
-        let resp = reqwest::Client::builder()
-            .build()?
-            .head(url.as_str())
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            bail!(
-                "failed to response status {} for {}",
-                resp.status(),
-                url.as_str()
-            );
-        }
-        let headers = resp.headers();
-        trace!("parsing mvn files info in headers: {:?}", headers);
-
-        let name = "Content-Length";
-        let size = if let Some(val) = headers.get(name) {
-            trace!("parsing header {}={:?}", name, val);
-            val.to_str()?.parse::<usize>()?
-        } else {
-            bail!("not found header: {}", name)
-        };
-
-        let name = "Last-Modified";
-        let last_modified = if let Some(val) = headers.get(name) {
-            trace!("parsing header {}={:?}", name, val);
-            DateTime::parse_from_rfc2822(val.to_str()?)?.with_timezone(&Local)
-        } else {
-            bail!("not found header: {}", name)
-        };
-
-        let name = "Content-Type";
-        let mime = if let Some(val) = headers.get(name) {
-            trace!("parsing header {}={:?}", name, val);
-            val.to_str()?.parse::<Mime>()?
-        } else {
-            bail!("not found header: {}", name);
-        };
-
-        //     match join!(
-        //         fetch_bin_metadata(url.clone()),
-        //         fetch_cxt(url.join(&format!("{}.md5", filename))?),
-        //         fetch_cxt(url.join(&format!("{}.sha1", filename))?),
-        //         fetch_cxt(url.join(&format!("{}.sha512", filename))?)
-        //     ) {
-        //         (Ok((filename, last_modified, size)), md5, sha1, sha512) => Ok(Self {
-        //             url,
-        //             filename,
-        //             last_modified,
-        //             size,
-        //             md5: md5.ok(),
-        //             sha1: sha1.ok(),
-        //             sha512: sha512.ok(),
-        //         }),
-        //         (Err(e), ..) => {
-        //             bail!("failed to fetch bin metadata for {}: {}", url, e);
-        //         }
-        //     }
-        Ok(BinFile {
-            filename,
-            last_modified,
-            mime,
-            size,
-            url,
-            md5: None,
-            sha1: None,
-            sha512: None,
-        })
+        let tasks = parse_bin_names(&content)?
+            .into_iter()
+            .map(|name| url.join(&name).map_err::<Error, _>(Into::into))
+            .map(|bin_url| {
+                bin_url.map(|url| {
+                    let content = content.clone();
+                    async move {
+                        trace!("fetching metadata and digest for {} in concurrent", url);
+                        try_join!(fetch_bin_metadata(&url), fetch_bin_digest(&url, &content)).map(
+                            |((filename, mime, size, last_modified), digest)| BinFile {
+                                digest,
+                                filename,
+                                last_modified,
+                                mime,
+                                size,
+                                url,
+                            },
+                        )
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        join_all(tasks)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
     }
 }
 
-fn parse_digest(content: &str) -> Result<Digest> {
-    todo!()
+/// 对url使用head请求获取binaries文件元数据
+/// 如：https://archive.apache.org/dist/maven/maven-3/3.8.4/binaries/apache-maven-3.8.4-bin.tar.gz
+async fn fetch_bin_metadata(url: &Url) -> Result<(String, Mime, usize, DateTime<Local>)> {
+    // parse http headers
+    let filename = get_filename(&url)?;
+    debug!("fetching bin metadata {} for {}", filename, url);
+    let resp = reqwest::Client::builder()
+        .build()?
+        .head(url.as_str())
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!(
+            "failed to response status {} for {}",
+            resp.status(),
+            url.as_str()
+        );
+    }
+
+    // parse headers
+    let headers = resp.headers();
+    trace!("parsing mvn files info in headers: {:?}", headers);
+    let parse_header = |name| {
+        if let Some(val) = headers.get(name) {
+            trace!("parsing header {}={:?}", name, val);
+            val.to_str().map_err(Into::into)
+        } else {
+            bail!("not found header: {}", name)
+        }
+    };
+
+    let mime = parse_header("Content-Type")?.parse::<Mime>()?;
+    let size = parse_header("Content-Length")?.parse::<usize>()?;
+    let last_modified = parse_header("Last-Modified")
+        .and_then(|s| DateTime::parse_from_rfc2822(s).map_err(Into::into))
+        .map(|d| d.with_timezone(&Local))?;
+    Ok((filename, mime, size, last_modified))
 }
 
 async fn fetch_cxt(url: Url) -> Result<String> {
@@ -347,41 +275,40 @@ fn parse_bin_names(content: &str) -> Result<Vec<String>> {
         .select(&link_selector)
         .map(|e| e.inner_html().trim().to_string())
         .collect::<Vec<_>>();
+    if names.is_empty() {
+        error!("failed to parse bin names empty in content: {}", content);
+        bail!("not found bin names");
+    }
     Ok(names)
 }
 
-fn parse_bin_names_digest(content: &str) -> Result<Vec<(String, Digest)>> {
-    trace!("parsing bin names in content size: {}", content.len());
-    let html = Html::parse_document(content);
-    let link_selector = Selector::parse("img[alt*='[  ']+a").map_err(|e| {
-        anyhow!(
-            "failed to parsing. kind: {:?}, location: {:?}",
-            e.kind,
-            e.location
-        )
-    })?;
-    let fields = Digest::get_field_names();
-    let names = html
-        .select(&link_selector)
-        .map(|e| e.inner_html().trim().to_string())
-        .map(|name| {
-            let dis = fields
-                .iter()
-                .map(|f| {
-                    if content.contains(&format!("{}.{}", name, f)) {
-                        Some(None::<String>)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-                // (name, Digest {
-
-                // })
-        })
-        .collect::<Vec<_>>();
-    todo!()
-    // Ok(names)
+async fn fetch_bin_digest(bin_url: &Url, content: &str) -> Result<Option<Digest>> {
+    let bin_name = Path::new(bin_url.path())
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("not found filename for {}", bin_url))?;
+    let content = content.to_ascii_lowercase();
+    for ext_name in Digest::VARIANTS {
+        let digest_filename = format!("{}.{}", bin_name, ext_name).to_ascii_lowercase();
+        if content.contains(&digest_filename) {
+            let digest_url = bin_url.join(&digest_filename)?;
+            let cxt = fetch_cxt(digest_url).await?;
+            let mut digest = ext_name.parse::<Digest>()?;
+            match &mut digest {
+                Digest::Md5(s) => {
+                    s.push_str(&cxt);
+                }
+                Digest::Sha1(s) => {
+                    s.push_str(&cxt);
+                }
+                Digest::Sha512(s) => {
+                    s.push_str(&cxt);
+                }
+            }
+            return Ok(Some(digest));
+        }
+    }
+    Ok(None)
 }
 
 /// 从html中解析出版本信息
@@ -427,9 +354,7 @@ mod tests {
             filename: "apache-maven-3.8.4-bin.tar.gz".to_string(),
             last_modified: DateTime::parse_from_rfc2822("Sun, 14 Nov 2021 13:25:01 GMT").unwrap().with_timezone(&Local),
             size: 9046177,
-            md5: None,
-            sha1: None,
-            sha512: Some(Some("a9b2d825eacf2e771ed5d6b0e01398589ac1bfa4171f36154d1b5787879605507802f699da6f7cfc80732a5282fd31b28e4cd6052338cbef0fa1358b48a5e3c8".to_string())),
+            digest: Some(Digest::Sha512("a9b2d825eacf2e771ed5d6b0e01398589ac1bfa4171f36154d1b5787879605507802f699da6f7cfc80732a5282fd31b28e4cd6052338cbef0fa1358b48a5e3c8".to_string())),
             mime: "application/x-gzip".parse().unwrap()
         }
     });
@@ -487,9 +412,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_parse_bin_names() -> Result<()> {
-        let content = r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+    static CONTENT: &str = r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
 <html>
  <head>
   <title>Index of /dist/maven/maven-3/3.8.4/binaries</title>
@@ -506,7 +429,9 @@ mod tests {
 <hr></pre>
 </body></html>"#;
 
-        let names = parse_bin_names(content)?;
+    #[test]
+    fn test_parse_bin_names() -> Result<()> {
+        let names = parse_bin_names(CONTENT)?;
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"apache-maven-3.8.4-bin.tar.gz".to_string()));
         assert!(names.contains(&"apache-maven-3.8.4-bin.zip".to_string()));
@@ -514,16 +439,25 @@ mod tests {
         Ok(())
     }
 
-    // #[tokio::test]
-    // async fn test_fetch_bin_metadata() -> Result<()> {
-    //     let bin = BIN_FILE.clone();
-    //     let res = fetch_bin_metadata(bin.url).await?;
+    #[tokio::test]
+    async fn test_fetch_bin_metadata() -> Result<()> {
+        let bin = BIN_FILE.clone();
+        let res = fetch_bin_metadata(bin.url()).await?;
 
-    //     assert_eq!(res.0, bin.filename);
-    //     assert_eq!(res.1, bin.last_modified);
-    //     assert_eq!(res.2, bin.size);
-    //     Ok(())
-    // }
+        assert_eq!(res.0, bin.filename);
+        assert_eq!(res.1, bin.mime);
+        assert_eq!(res.2, bin.size);
+        assert_eq!(res.3, bin.last_modified);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_bin_digest() -> Result<()> {
+        let bin = BIN_FILE.clone();
+        let res = fetch_bin_digest(bin.url(), CONTENT).await?;
+        assert_eq!(res, bin.digest);
+        Ok(())
+    }
 
     #[cfg(test)]
     mod binfile_tests {

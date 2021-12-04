@@ -11,8 +11,9 @@ use which::which;
 use crate::site::BinFile;
 
 pub fn match_digests(path: impl AsRef<Path>, bin: &BinFile) -> bool {
-    // todo!()
-    true
+    let data = path.as_ref().metadata().unwrap();
+    // todo: digest
+    data.len() == *bin.size() as u64
 }
 
 pub fn extract<P: AsRef<Path>>(from: P, to: P) -> Result<()> {
@@ -23,7 +24,7 @@ pub fn extract<P: AsRef<Path>>(from: P, to: P) -> Result<()> {
     if let Ok(p) = which("tar") {
         debug!("try using tar to extract {}", from.display());
         let to_str = to.to_str().unwrap();
-        let out = run_fun!($p xvf --directory=$to_str).map_err(|e| {
+        let out = run_fun!($p xvf $from --directory=$to_str).map_err(|e| {
             error!("failed to extract by tar: {}", e);
             e
         })?;
