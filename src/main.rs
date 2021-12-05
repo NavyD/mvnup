@@ -1,31 +1,30 @@
 use std::{
     collections::HashSet,
-    fs::File,
-    os::unix::prelude::PermissionsExt,
-    path::{Path, PathBuf},
+    fs::{remove_dir_all, remove_file},
+    path::PathBuf,
     process::exit,
     sync::Arc,
 };
 
 use anyhow::{anyhow, bail, Error, Result};
-use cmd_lib::run_fun;
+
 use comfy_table::Table;
-use directories::{BaseDirs, ProjectDirs, UserDirs};
-use futures_util::StreamExt;
+use directories::BaseDirs;
 use futures_util::{future::join_all, try_join};
 use glob::glob;
 use log::{debug, info, trace, warn};
 use mvnup::{
-    site::{BinFile, Site, HTTP_CLIENT},
+    site::{BinFile, Site},
     util::{extract, find_java_version, find_mvn_version, match_digests},
     CRATE_NAME,
 };
 use semver::{Version, VersionReq};
 use structopt::StructOpt;
+use tokio::fs as afs;
 use tokio::sync::Mutex;
-use tokio::{fs as afs, io::AsyncWriteExt};
 use url::Url;
 use which::which;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt = Opt::from_args();
@@ -34,7 +33,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, StructOpt, Clone)]
 pub struct Opt {
     #[structopt(long, short, default_value = "https://archive.apache.org/dist/")]
     mirror: Url,
@@ -61,7 +60,7 @@ impl Opt {
     }
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, StructOpt, Clone)]
 enum Commands {
     Install {
         #[structopt(flatten)]
@@ -75,10 +74,9 @@ enum Commands {
         #[structopt(flatten)]
         args: ListArgs,
     },
-    Clean,
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, StructOpt, Clone)]
 struct InstallArgs {
     #[structopt(long, short)]
     path: PathBuf,
@@ -87,7 +85,7 @@ struct InstallArgs {
     version: Option<String>,
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, StructOpt, Clone)]
 struct ListArgs {
     #[structopt(long, short, default_value = "5")]
     limit: usize,
@@ -129,6 +127,12 @@ impl Program {
                     exit(1);
                 }
             }
+            Some(Commands::Uninstall) => {
+                if let Err(e) = self.uninstall().await {
+                    eprintln!("uninstall failed: {}", e);
+                    exit(1);
+                }
+            }
             None => {
                 if let Err(e) = self.check().await {
                     eprintln!("check failed: {}", e);
@@ -140,6 +144,31 @@ impl Program {
                 exit(1)
             }
         }
+    }
+
+    async fn uninstall(&self) -> Result<()> {
+        let bin_link_path = which("mvn").map_err(|e| anyhow!("not found maven path: {}", e))?;
+        if !bin_link_path.metadata()?.file_type().is_symlink() {
+            anyhow!(
+                "failed to uninstall: {} is not installed by {}",
+                bin_link_path.display(),
+                CRATE_NAME
+            );
+        }
+
+        let bin_path = bin_link_path.read_link()?;
+        let bin_home = bin_path
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| anyhow!("not found 2 parents dir for {}", bin_path.display()))?;
+
+        println!("removing mvn home path: {}", bin_home.display());
+        remove_dir_all(bin_home)?;
+
+        println!("removing a link {}", bin_link_path.display());
+        remove_file(bin_link_path)?;
+
+        Ok(())
     }
 
     async fn install(&self, args: &InstallArgs) -> Result<()> {
@@ -382,19 +411,47 @@ impl Program {
     }
 }
 
-struct Downloader {
-    cache_dir: PathBuf,
-}
+#[cfg(test)]
+mod tests {
+    use once_cell::sync::Lazy;
+    use tempfile::{tempdir, TempDir};
 
-impl Downloader {
-    pub fn new() -> Result<Self> {
-        let basedir = BaseDirs::new().ok_or_else(|| anyhow!("not found base dir"))?;
-        Ok(Self {
-            cache_dir: basedir.cache_dir().join(CRATE_NAME),
+    use super::*;
+
+    static TEMP_CACHE_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
+
+    fn new(opt: &Opt) -> Result<Program> {
+        let base_dir = BaseDirs::new().ok_or_else(|| anyhow!("not found base dir"))?;
+        let cache_dir = TEMP_CACHE_DIR.path().join(CRATE_NAME);
+        std::fs::create_dir_all(&cache_dir)?;
+        Ok(Program {
+            versions: Arc::new(Mutex::new(vec![])),
+            site: Site::new(opt.mirror.clone()).expect("new site error"),
+            opt: opt.clone(),
+            cache_dir,
+            base_dir,
         })
     }
 
-    pub fn download(&self, url: &str) -> Result<()> {
-        todo!()
+    #[tokio::test]
+    async fn test_match_version() -> Result<()> {
+        let opt = Opt::from_iter([] as [&str; 0]);
+        let p = new(&opt)?;
+        let latest_ver = p.latest_version().await?;
+
+        let res = p.match_version(&latest_ver.to_string()).await?;
+        assert_eq!(res, latest_ver);
+
+        let res = p.match_version(">= 3").await?;
+        assert_eq!(res, latest_ver);
+
+        let ver = "3.8.3";
+        let res = p.match_version(&format!("<= {}", ver)).await?;
+        assert_eq!(res, ver.parse()?);
+
+        let ver = "3.8";
+        let res = p.match_version(&format!("< {}", ver)).await?;
+        assert_eq!(res, "3.6.3".parse()?);
+        Ok(())
     }
 }

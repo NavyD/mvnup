@@ -1,4 +1,4 @@
-use std::{fmt::Display, path::Path};
+use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 use cmd_lib::run_fun;

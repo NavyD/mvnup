@@ -1,7 +1,7 @@
 use crate::util::get_filename;
 use anyhow::{anyhow, bail, Error, Result};
 use chrono::{DateTime, Local};
-use futures_util::{future::join_all, join, try_join, StreamExt, TryFutureExt};
+use futures_util::{future::join_all, try_join, StreamExt};
 use getset::Getters;
 use log::{debug, error, info, log_enabled, trace, warn};
 use mime::Mime;
@@ -9,14 +9,8 @@ use once_cell::sync::Lazy;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use semver::Version;
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Display,
-    io::{BufReader, Cursor, Read},
-    path::Path,
-    time::Duration,
-};
-use strum::{AsRefStr, Display, EnumString, EnumVariantNames, VariantNames};
+use std::{fmt::Display, path::Path, time::Duration};
+use strum::{AsRefStr, EnumString, EnumVariantNames, VariantNames};
 use tokio::{fs as afs, io::AsyncWriteExt};
 use url::Url;
 
@@ -26,61 +20,6 @@ pub static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .build()
         .expect("build client failed")
 });
-
-// macro_rules! field_names {
-//     (struct $name:ident {
-//         $($field_name:ident: $field_type:ty,)*
-//     }) => {
-//         #[derive(Debug, PartialEq, Eq, Clone, Getters, Default)]
-//         pub struct $name {
-//             $($field_name: $field_type,)*
-//         }
-
-//         impl $name {
-//             // This is purely an example—not a good one.
-//             fn get_field_names() -> Vec<&'static str> {
-//                 vec![$(stringify!($field_name)),*]
-//             }
-
-//             fn from_entries(v: impl std::iter::IntoIterator<Item = (String, Option<Option<String>>)>) -> Self {
-//                 let v = v.into_iter().collect::<::std::collections::HashMap<_, _>>();
-//                 Self {$(
-//                     $field_name: v["$field_name"].clone(),
-//                 )*}
-//             }
-//         }
-//     }
-// }
-macro_rules! field_names {
-    (
-        $(#[$m:meta])?
-        $aa:vis enum $name:ident {
-        $($field_name:ident($field_type:ty))*
-
-    }) => {
-        // #[derive(Debug, PartialEq, Eq, Clone, Getters, Default)]
-        // pub struct $name {
-        //     $($field_name: $field_type,)*
-        // }
-        $aa enum $name {
-            $($field_name($field_type))*
-        }
-
-        impl $name {
-            pub fn new(variant_name: &str, cxt: &str) -> Self {
-                todo!()
-            }
-        }
-    }
-}
-
-// field_names! {
-//     struct Digest {
-//         sha512: Option<Option<String>>,
-//         md5: Option<Option<String>>,
-//         sha1: Option<Option<String>>,
-//     }
-// }
 
 #[derive(Debug, Clone, PartialEq, Eq, EnumVariantNames, EnumString, AsRefStr)]
 pub enum Digest {
@@ -124,7 +63,7 @@ impl BinFile {
             );
         }
         // self.digest.map(|digest| digest.check(s))
-        if let Some(d) = self.digest() {
+        if let Some(_d) = self.digest() {
             // todo!()
             return Ok(());
         } else {
@@ -461,7 +400,6 @@ mod tests {
 
     #[cfg(test)]
     mod binfile_tests {
-        use super::*;
 
         // #[tokio::test]
         // async fn test_new() -> Result<()> {
