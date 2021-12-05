@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Error, Result};
-
 use comfy_table::Table;
 use directories::BaseDirs;
 use futures_util::{future::join_all, try_join};
@@ -67,7 +66,7 @@ enum Commands {
         args: InstallArgs,
     },
     Update {
-        version: String,
+        version: Option<String>,
     },
     Uninstall,
     List {
@@ -133,22 +132,64 @@ impl Program {
                     exit(1);
                 }
             }
+            Some(Commands::Update { version }) => {
+                if let Err(e) = self.update(version.as_deref()).await {
+                    eprintln!("update failed: {}", e);
+                    exit(1);
+                }
+            }
             None => {
                 if let Err(e) = self.check().await {
                     eprintln!("check failed: {}", e);
                     exit(1);
                 }
             }
-            _ => {
-                eprintln!("unsupported");
-                exit(1)
-            }
         }
+    }
+
+    async fn update(&self, version: Option<&str>) -> Result<()> {
+        let bin_link_path = which("mvn")?;
+        if !bin_link_path.symlink_metadata()?.file_type().is_symlink() {
+            bail!(
+                "not found mvn installed path for bin: {}",
+                bin_link_path.display()
+            );
+        }
+        let bin_path = bin_link_path.read_link()?;
+
+        let installed_ver = find_mvn_version(&bin_path)?;
+        let ver = if let Some(ver_pat) = version {
+            self.match_version(ver_pat).await?
+        } else {
+            self.latest_version().await?
+        };
+
+        let mvn_path = match installed_ver.cmp(&ver) {
+            std::cmp::Ordering::Less => bin_path
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
+                .ok_or_else(|| anyhow!("not found 3 parents in {}", bin_path.display()))?,
+            std::cmp::Ordering::Equal => {
+                bail!("same version: {}", ver);
+            }
+            std::cmp::Ordering::Greater => {
+                bail!("less version: {}", ver);
+            }
+        };
+        println!("found mvn path: {}", mvn_path.display());
+        self.uninstall().await?;
+        let args = InstallArgs {
+            path: mvn_path.to_path_buf(),
+            version: Some(ver.to_string()),
+        };
+        self.install(&args).await?;
+        Ok(())
     }
 
     async fn uninstall(&self) -> Result<()> {
         let bin_link_path = which("mvn").map_err(|e| anyhow!("not found maven path: {}", e))?;
-        if !bin_link_path.metadata()?.file_type().is_symlink() {
+        if !bin_link_path.symlink_metadata()?.file_type().is_symlink() {
             anyhow!(
                 "failed to uninstall: {} is not installed by {}",
                 bin_link_path.display(),
@@ -203,21 +244,8 @@ impl Program {
             mvn_version,
             to_path.display()
         );
-
-        // select one
-        let bins = self.site.fetch_bins(mvn_version).await?;
-        let select_bin = self.choose_bin(&bins)?;
-
         // download
-        let down_path = self.cache_dir.join(select_bin.filename());
-        if down_path.is_file() && match_digests(down_path.as_path(), select_bin) {
-            // cache
-            println!("using cached file: {}", down_path.display());
-        } else {
-            println!("downloading {}", select_bin.filename());
-            select_bin.download(down_path.as_path()).await?;
-        }
-
+        let down_path = self.download(&mvn_version).await?;
         // extract to path
         extract(down_path.as_path(), to_path)?;
 
@@ -248,6 +276,21 @@ impl Program {
             exe_path.display()
         );
         Ok(())
+    }
+
+    async fn download(&self, ver: &Version) -> Result<PathBuf> {
+        let bins = self.site.fetch_bins(ver.clone()).await?;
+        let select_bin = self.choose_bin(&bins)?;
+
+        let down_path = self.cache_dir.join(select_bin.filename());
+        if down_path.is_file() && match_digests(down_path.as_path(), select_bin) {
+            // cache
+            println!("using cached file: {}", down_path.display());
+        } else {
+            println!("downloading {}", select_bin.filename());
+            select_bin.download(down_path.as_path()).await?;
+        }
+        Ok(down_path)
     }
 
     fn choose_bin<'a>(&self, bins: &'a [BinFile]) -> Result<&'a BinFile> {
