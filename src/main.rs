@@ -1,10 +1,4 @@
-use std::{
-    collections::HashSet,
-    fs::{remove_dir_all, remove_file},
-    path::PathBuf,
-    process::exit,
-    sync::Arc,
-};
+use std::{collections::HashSet, fs::{remove_file, remove_dir_all}, path::PathBuf, process::exit, sync::Arc};
 
 use anyhow::{anyhow, bail, Error, Result};
 use comfy_table::Table;
@@ -15,7 +9,6 @@ use log::{debug, info, trace, warn};
 use mvnup::{
     site::{BinFile, Site},
     util::{extract, find_java_version, find_mvn_version, match_digests},
-    CRATE_NAME,
 };
 use semver::{Version, VersionReq};
 use structopt::StructOpt;
@@ -62,38 +55,24 @@ impl Opt {
 #[derive(Debug, StructOpt, Clone)]
 enum Commands {
     Install {
-        #[structopt(flatten)]
-        args: InstallArgs,
+        #[structopt(long, short)]
+        version: Option<String>,
     },
     Update {
         version: Option<String>,
     },
     Uninstall,
     List {
-        #[structopt(flatten)]
-        args: ListArgs,
+        #[structopt(long, short, default_value = "5")]
+        limit: usize,
     },
-}
-
-#[derive(Debug, StructOpt, Clone)]
-struct InstallArgs {
-    #[structopt(long, short)]
-    path: PathBuf,
-
-    #[structopt(long, short)]
-    version: Option<String>,
-}
-
-#[derive(Debug, StructOpt, Clone)]
-struct ListArgs {
-    #[structopt(long, short, default_value = "5")]
-    limit: usize,
 }
 
 struct Program {
     opt: Opt,
     manager: Manager,
     base_dir: BaseDirs,
+    project_dirs: ProjectDirs,
 }
 
 impl Program {
@@ -103,19 +82,21 @@ impl Program {
             manager: Manager::new(Site::new(opt.mirror.clone()).expect("new site error"))?,
             opt,
             base_dir,
+            project_dirs: ProjectDirs::from("xyz", "navyd", "mvnup")
+                .ok_or_else(|| anyhow!("project dir error"))?,
         })
     }
 
     pub async fn run(&self) {
         match &self.opt.commands {
-            Some(Commands::List { args }) => {
-                if let Err(e) = self.list(args).await {
+            Some(Commands::List { limit }) => {
+                if let Err(e) = self.list(*limit).await {
                     eprintln!("list failed: {}", e);
                     exit(1);
                 }
             }
-            Some(Commands::Install { args }) => {
-                if let Err(e) = self.install(args).await {
+            Some(Commands::Install { version }) => {
+                if let Err(e) = self.install(version.as_deref()).await {
                     eprintln!("install failed: {}", e);
                     exit(1);
                 }
@@ -173,82 +154,95 @@ impl Program {
         };
         println!("found mvn path: {}", mvn_path.display());
         self.uninstall().await?;
-        let args = InstallArgs {
-            path: mvn_path.to_path_buf(),
-            version: Some(ver.to_string()),
-        };
-        self.install(&args).await?;
+        self.install(Some(&ver.to_string())).await?;
         Ok(())
     }
 
     async fn uninstall(&self) -> Result<()> {
         let bin_link_path = which("mvn").map_err(|e| anyhow!("not found maven path: {}", e))?;
-        if !bin_link_path.symlink_metadata()?.file_type().is_symlink() {
-            anyhow!(
-                "failed to uninstall: {} is not installed by {}",
-                bin_link_path.display(),
-                CRATE_NAME
-            );
+        if let Some(exe_path) = self.base_dir.executable_dir().map(|p| p.join("mvn")) {
+            if exe_path != bin_link_path {
+                bail!(
+                    "inconsistent bin path: {}, original path: {}",
+                    bin_link_path.display(),
+                    exe_path.display()
+                );
+            }
         }
 
-        let bin_path = bin_link_path.read_link()?;
-        let bin_home = bin_path
+        let bin_path = bin_link_path
+            .read_link()
+            .map_err(|e| anyhow!("{} is not a link: {}", bin_link_path.display(), e))?;
+
+        let ver = find_mvn_version(&bin_path)?;
+
+        let bin_data_paths = glob(&format!(
+            "{}/*{}*/**/mvn",
+            self.project_dirs.data_dir().display(),
+            ver,
+        ))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err::<Error, _>(Into::into)?;
+        debug!("found bin exe paths {:?}", bin_data_paths);
+        if bin_data_paths.is_empty() {
+            bail!(
+                "not found mvn bin in data dir: {}",
+                self.project_dirs.data_dir().display()
+            );
+        } else if bin_data_paths.len() >= 2 {
+            bail!("found multiple bin paths: {:?}", bin_data_paths);
+        }
+
+        // remove mvn home
+        let installed_path = &bin_data_paths[0];
+        let mvn_home = installed_path
             .parent()
             .and_then(|p| p.parent())
-            .ok_or_else(|| anyhow!("not found 2 parents dir for {}", bin_path.display()))?;
+            .ok_or_else(|| anyhow!("not found 2 parents dir for {}", installed_path.display()))?;
+        println!("removing a mvn home {}", mvn_home.display());
+        remove_dir_all(mvn_home)?;
 
-        println!("removing mvn home path: {}", bin_home.display());
-        remove_dir_all(bin_home)?;
-
-        println!("removing a link {}", bin_link_path.display());
-        remove_file(bin_link_path)?;
-
+        // remove link
+        println!("removing a mvn link {}", bin_link_path.display());
+        remove_file(&bin_link_path)?;
         Ok(())
     }
 
-    async fn install(&self, args: &InstallArgs) -> Result<()> {
+    async fn install(&self, version: Option<&str>) -> Result<()> {
         if let Ok(p) = which("mvn") {
             bail!(
-                "already installed {} version of mvn: {}",
+                "found installed version {} in {}",
                 find_mvn_version(&p)?,
                 p.display()
             );
         }
 
-        let to_path = args.path.as_path();
+        let install_path = self.project_dirs.data_dir();
         // check path
-        if !to_path.exists() {
-            info!("creating dir of install: {}", to_path.display());
-            afs::create_dir_all(to_path).await?;
-        } else if !to_path.is_dir() {
-            bail!("{} is not a dir", to_path.display());
-        } else if to_path.read_dir().map(|mut dir| dir.next().is_some())? {
-            bail!("{} is not a empty dir", to_path.display());
+        if !install_path.exists() {
+            info!("creating dir {} for installation", install_path.display());
+            afs::create_dir_all(install_path).await?;
+        } else if !install_path.is_dir() {
+            bail!("{} is not a dir", install_path.display());
         }
 
         // match mvn version
-        let mvn_version = if let Some(ver_pat) = &args.version {
+        let mvn_version = if let Some(ver_pat) = version {
             self.manager.match_version(ver_pat).await?
         } else {
             self.manager.latest_version().await?
         };
-
-        println!(
-            "selected mvn version {} of installation to {}",
-            mvn_version,
-            to_path.display()
-        );
         // download
         let down_path = self.manager.download(&mvn_version).await?;
         // extract to path
-        extract(down_path.as_path(), to_path)?;
+        extract(down_path.as_path(), install_path)?;
 
         // link to $PATH
-        let exe_path = glob(&format!("{}/**/mvn", to_path.display()))
+        let exe_path = glob(&format!("{}/**/mvn", install_path.display()))
             .map_err::<Error, _>(Into::into)?
             .flatten()
             .next()
-            .ok_or_else(|| anyhow!("not found mvn bin in {}", to_path.display()))?
+            .ok_or_else(|| anyhow!("not found mvn bin in {}", install_path.display()))?
             .canonicalize()?;
         #[cfg(target_os = "linux")]
         {
@@ -260,7 +254,7 @@ impl Program {
                         exe_path.display(),
                     );
                     std::os::unix::fs::symlink(exe_path, bin_path)?;
-                    println!("installation successful. just type: mvn");
+                    println!("installation successful. just type: mvn --version");
                     return Ok(());
                 }
             }
@@ -272,12 +266,12 @@ impl Program {
         Ok(())
     }
 
-    async fn list(&self, args: &ListArgs) -> Result<()> {
+    async fn list(&self, limit: usize) -> Result<()> {
         let vers = self.manager.versions().await?;
-        let limit = if vers.len() < args.limit {
+        let limit = if vers.len() < limit {
             vers.len()
         } else {
-            args.limit
+            limit
         };
         println!("fetching info of {} versions:", limit);
         let bins = self.manager.get_multi_bins(&vers[..limit]).await?;
@@ -395,7 +389,7 @@ impl Manager {
             // cache
             println!("using cached file: {}", down_path.display());
         } else {
-            println!("downloading {}", select_bin.filename());
+            println!("downloading {} of version: {}", select_bin.filename(), ver);
             select_bin.download(down_path.as_path()).await?;
         }
         Ok(down_path)
