@@ -90,9 +90,9 @@ impl Site {
 
     /// 获取版本信息
     pub async fn fetch_versions(&self) -> Result<Vec<Version>> {
-        let url = format!("{}/maven/maven-3/", self.mirror);
+        let url = self.mirror.join("maven/maven-3/")?;
         debug!("fetching versions from {}", url);
-        parse_versions(&reqwest::get(&url).await?.text().await?)
+        parse_versions(&reqwest::get(url).await?.text().await?)
     }
 
     /// 获取binaries中的文件信息

@@ -1,4 +1,10 @@
-use std::{collections::HashSet, fs::{remove_file, remove_dir_all}, path::PathBuf, process::exit, sync::Arc};
+use std::{
+    collections::HashSet,
+    fs::{remove_dir_all, remove_file},
+    path::PathBuf,
+    process::exit,
+    sync::Arc,
+};
 
 use anyhow::{anyhow, bail, Error, Result};
 use comfy_table::Table;
@@ -9,6 +15,7 @@ use log::{debug, info, trace, warn};
 use mvnup::{
     site::{BinFile, Site},
     util::{extract, find_java_version, find_mvn_version, match_digests},
+    CRATE_NAME,
 };
 use semver::{Version, VersionReq};
 use structopt::StructOpt;
@@ -82,7 +89,7 @@ impl Program {
             manager: Manager::new(Site::new(opt.mirror.clone()).expect("new site error"))?,
             opt,
             base_dir,
-            project_dirs: ProjectDirs::from("xyz", "navyd", "mvnup")
+            project_dirs: ProjectDirs::from("xyz", "navyd", CRATE_NAME)
                 .ok_or_else(|| anyhow!("project dir error"))?,
         })
     }
@@ -356,7 +363,7 @@ struct Manager {
 
 impl Manager {
     pub fn new(site: Site) -> Result<Self> {
-        let project_dirs = ProjectDirs::from("xyz", "navyd", "mvnup")
+        let project_dirs = ProjectDirs::from("xyz", "navyd", CRATE_NAME)
             .ok_or_else(|| anyhow!("project dir error"))?;
         let cache_dir = project_dirs.cache_dir().to_path_buf();
         std::fs::create_dir_all(&cache_dir)?;
@@ -426,7 +433,7 @@ impl Manager {
     async fn latest_version(&self) -> Result<Version> {
         self.versions()
             .await
-            .map(|vers| vers.first().cloned().unwrap())
+            .and_then(|vers| vers.first().cloned().ok_or_else(|| anyhow!("")))
     }
 
     async fn get_multi_bins(&self, versions: &[Version]) -> Result<Vec<(Version, Vec<BinFile>)>> {
